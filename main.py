@@ -1,295 +1,278 @@
 #!/usr/bin/env python3
-"""Forecast GTA VI trophy earn rates on Exophase at the case target.
+"""Forecast GTA VI trophy earn rates at week one (v2).
 
-Per trophy, fit a saturating log-time growth curve to the logit of the
-recorded earn rates, y = a + b * ln(1 + t), and emit five quantiles of the
-rate at the target. The spread combines a random-walk term, the fit
-residual, and a fixed floor for refresh / re-basing uncertainty: the
-history Exophase shows is only as fresh as its last refresh, so a flat
-history must not be read as zero uncertainty.
+For every trophy, fit a saturating log-time curve to the logit of its
+earn rate over the case history, shrink the fitted slope toward the
+global mean slope across trophies, and widen the spread with a large
+refresh floor so a sudden Exophase recount (as on launch night, when
+every rate but the one at 100% fell at once) stays inside the band.
 
-Standard library only. Deterministic: no randomness, no wall clock.
+Standard library only, deterministic, no network, no wall clock.
 Reads $MAKEFUN_INPUT_DIR (default /input), writes $MAKEFUN_OUTPUT_DIR
-(default /output), one <id>.out per <id>.in, sorted by file name.
+(default /output), one <stem>.out per *.in file.
 """
 
 import json
 import math
 import os
-import sys
 from datetime import datetime, timezone
 
 Z_VALUES = (-1.645, -0.674, 0.0, 0.674, 1.645)
-REFRESH_FLOOR = 0.8
-# Raised from 0.6 after the practice runs: the house's first refresh
-# (players tracked 638 -> 3,868, a 6.06x jump) cut the mean earn rate
-# from 2.687% to 2.010%, a x0.748 dilution, about -0.29 logit on
-# average -- and rare trophies dilute further, since their holder count
-# grows slower than the player base, plausibly -0.6 to -1.1 logit.
-# A 0.6 floor gives a 90-minute spread of only 0.613, so its 90% band
-# (+/-1.01 logit) barely covers that tail. Pinball loss is asymmetric
-# here: a trophy outside the band costs ~1.9 per logit at the outer
-# quantiles, while a slightly wider band costs only ~0.1 per logit
-# when the rate lands inside it. 0.8 lifts the 90-minute spread to
-# 0.810 and the final's (6,510-minute horizon) spread from 1.22 to
-# 1.33, where the random-walk term dominates -- cheap insurance.
-MAX_SPREAD = 2.5
-MAX_MOVE = 2.0
-RATE_LO = 0.01
-RATE_HI = 99.99
-DEFAULT_MEDIAN_RATE = 1.0
-
-
-def parse_time(text):
-    """Parse an ISO 8601 UTC timestamp into an aware datetime."""
-    if not isinstance(text, str):
-        raise ValueError("not a timestamp string")
-    cleaned = text.strip()
-    if cleaned.endswith("Z"):
-        cleaned = cleaned[:-1] + "+00:00"
-    parsed = datetime.fromisoformat(cleaned)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+RW_COEF = 0.5
+REFRESH_FLOOR = 1.8
+RESIDUAL_FLOOR = 0.25
+SPREAD_CAP = 2.5
+MOVE_CAP = 2.0
+SHRINK_PRIOR = 3.0
+NO_HISTORY_RATE = 1.0
 
 
 def clamp_rate(rate):
-    return min(max(float(rate), RATE_LO), RATE_HI)
+    if rate is None:
+        return None
+    try:
+        value = float(rate)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value):
+        return None
+    return min(99.99, max(0.01, value))
 
 
-def logit(rate):
-    p = clamp_rate(rate) / 100.0
+def logit_of(pct):
+    p = clamp_rate(pct) / 100.0
     return math.log(p / (1.0 - p))
 
 
-def inv_logit(value):
-    value = min(max(value, -700.0), 700.0)
-    return 100.0 / (1.0 + math.exp(-value))
+def inv_logit_pct(logit_value):
+    if logit_value >= 0:
+        return 100.0 / (1.0 + math.exp(-logit_value))
+    exp_value = math.exp(logit_value)
+    return 100.0 * exp_value / (1.0 + exp_value)
 
 
-def round_4(value):
-    """Round to 4 decimals, half-up; emit whole numbers as ints."""
-    rounded = math.floor(value * 10000.0 + 0.5) / 10000.0
-    rounded = min(max(rounded, RATE_LO), RATE_HI)
-    if rounded == int(rounded):
-        return int(rounded)
-    return rounded
+def round4(value):
+    scaled = value * 10000.0
+    whole = math.floor(scaled)
+    if scaled - whole >= 0.5:
+        whole += 1
+    result = whole / 10000.0
+    return int(result) if float(result).is_integer() else result
 
 
-def quantiles(median_logit, spread):
-    out = []
-    for z in Z_VALUES:
-        out.append(round_4(inv_logit(median_logit + z * spread)))
-    # Rounding and clamping are monotone, but enforce the contract.
-    for k in range(1, len(out)):
-        if out[k] < out[k - 1]:
-            out[k] = out[k - 1]
-    return out
-
-
-def random_walk_spread(horizon_minutes):
+def parse_time(text):
+    if not isinstance(text, str):
+        return None
     try:
-        horizon = float(horizon_minutes)
-    except (TypeError, ValueError):
-        horizon = 0.0
-    if horizon < 0.0:
-        horizon = 0.0
-    return 0.5 * math.sqrt(horizon / 1440.0)
+        moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment
 
 
-def fit_curve(pairs):
-    """Least-squares fit of y = a + b * ln(1 + t) over (t_hours, y) pairs.
-
-    Returns (a, b, residual_sd, used_fit). The fit is only used when
-    there are at least 3 pairs with distinct t and non-constant y;
-    otherwise b = 0 and a = the last y (persistence).
-    """
-    n = len(pairs)
-    if n < 3:
-        return pairs[-1][1] if pairs else logit(DEFAULT_MEDIAN_RATE), 0.0, 0.0, False
-    xs = [math.log1p(t) for t, _ in pairs]
-    ys = [y for _, y in pairs]
-    if len(set(xs)) < 2 or len(set(ys)) < 2:
-        return ys[-1], 0.0, 0.0, False
+def least_squares(xs, ys):
+    n = len(xs)
     mean_x = sum(xs) / n
     mean_y = sum(ys) / n
     sxx = sum((x - mean_x) ** 2 for x in xs)
     if sxx <= 0.0:
-        return ys[-1], 0.0, 0.0, False
+        return None
     sxy = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
-    b = sxy / sxx
-    a = mean_y - b * mean_x
-    resid_sq = sum((y - (a + b * x)) ** 2 for x, y in zip(xs, ys))
-    if n > 2:
-        s_fit = math.sqrt(resid_sq / (n - 2))
+    slope = sxy / sxx
+    intercept = mean_y - slope * mean_x
+    return slope, intercept
+
+
+def residual_sd(xs, ys, slope, intercept):
+    n = len(xs)
+    if n <= 2:
+        return 0.0
+    total = sum((y - (intercept + slope * x)) ** 2 for x, y in zip(xs, ys))
+    return math.sqrt(total / (n - 2))
+
+
+def forecast_trophy(pairs, target_x, horizon_minutes, last_logit,
+                     global_slope):
+    """pairs: list of (x, logit) history points for one trophy.
+    Returns (median_logit, spread)."""
+    horizon_days = max(0.0, horizon_minutes) / 1440.0
+    walk = RW_COEF * math.sqrt(horizon_days)
+    if last_logit is None:
+        median = logit_of(NO_HISTORY_RATE)
+        spread = min(SPREAD_CAP, math.sqrt(walk * walk
+                                           + RESIDUAL_FLOOR ** 2
+                                           + REFRESH_FLOOR ** 2))
+        return median, spread
+    if len(pairs) >= 3:
+        xs = [p[0] for p in pairs]
+        ys = [p[1] for p in pairs]
+        distinct_times = len(set(xs)) >= 2
+        varied_rates = max(ys) - min(ys) > 0.0
+        fit = least_squares(xs, ys) if distinct_times and varied_rates else None
     else:
-        s_fit = 0.0
-    return a, b, s_fit, True
-
-
-def forecast_trophy(pairs, last_y, target_hours, horizon_minutes):
-    """Median logit and spread for one trophy.
-
-    pairs: valid (t_hours, y) history pairs, oldest first.
-    last_y: logit of the last valid rate, or None when there is none.
-    target_hours: hours from the first read's slot to the target.
-    """
-    rw = random_walk_spread(horizon_minutes)
-    if last_y is None:
-        median_logit = logit(DEFAULT_MEDIAN_RATE)
-        spread = min(math.sqrt(rw * rw + REFRESH_FLOOR * REFRESH_FLOOR), MAX_SPREAD)
-        return median_logit, spread
-    a, b, s_fit, _used = fit_curve(pairs)
-    median_logit = a + b * math.log1p(target_hours)
-    move = median_logit - last_y
-    if move > MAX_MOVE:
-        median_logit = last_y + MAX_MOVE
-    elif move < -MAX_MOVE:
-        median_logit = last_y - MAX_MOVE
-    spread = min(math.sqrt(rw * rw + s_fit * s_fit + REFRESH_FLOOR * REFRESH_FLOOR), MAX_SPREAD)
-    return median_logit, spread
-
-
-def persistence_rows(trophies, history, horizon_minutes):
-    """Fallback forecast: last rate per trophy, random-walk spread only."""
-    rw = random_walk_spread(horizon_minutes)
-    rows = []
-    for idx, trophy in enumerate(trophies):
-        last_rate = None
-        for read in reversed(history):
-            rates = read.get("rates") or []
-            if idx < len(rates) and rates[idx] is not None:
-                last_rate = rates[idx]
-                break
-        if last_rate is None:
-            median_logit = logit(DEFAULT_MEDIAN_RATE)
-        else:
-            median_logit = logit(last_rate)
-        rows.append({"id": trophy["id"], "q": quantiles(median_logit, rw)})
-    return rows
+        fit = None
+    if fit is not None:
+        slope, intercept = fit
+        weight = len(pairs)
+        shrunk = (weight * slope + SHRINK_PRIOR * global_slope) / (
+            weight + SHRINK_PRIOR)
+        median = intercept + shrunk * target_x
+        resid = residual_sd(xs, ys, slope, intercept)
+    else:
+        median = last_logit
+        resid = 0.0
+    if median > last_logit + MOVE_CAP:
+        median = last_logit + MOVE_CAP
+    elif median < last_logit - MOVE_CAP:
+        median = last_logit - MOVE_CAP
+    resid = max(resid, RESIDUAL_FLOOR)
+    spread = min(SPREAD_CAP, math.sqrt(walk * walk + resid * resid
+                                       + REFRESH_FLOOR ** 2))
+    return median, spread
 
 
 def forecast_case(case):
-    trophies = case["trophies"]
+    trophies = case.get("trophies") or []
     history = case.get("history") or []
-    horizon_minutes = case.get("horizon_minutes", 0)
+    horizon = case.get("horizon_minutes") or 0
     try:
-        target = parse_time(case["target"])
-    except (KeyError, ValueError, TypeError):
-        target = None
-
-    if not history:
-        # No reads at all: median 1.0% for every trophy, honest spread.
-        rw = random_walk_spread(horizon_minutes)
-        spread = min(math.sqrt(rw * rw + REFRESH_FLOOR * REFRESH_FLOOR), MAX_SPREAD)
-        median_logit = logit(DEFAULT_MEDIAN_RATE)
-        return [
-            {"id": trophy["id"], "q": quantiles(median_logit, spread)}
-            for trophy in trophies
-        ]
-
-    first_read = history[0]
-    try:
-        first_slot = parse_time(first_read.get("slot") or first_read.get("at"))
-    except (ValueError, TypeError):
-        first_slot = None
-    if target is not None and first_slot is not None:
-        target_hours = (target - first_slot).total_seconds() / 3600.0
-    else:
-        target_hours = 0.0
-    if target_hours < 0.0:
-        target_hours = 0.0
-
-    # Valid (t_hours, y) pairs per trophy, t since the first read's slot.
-    rows = []
-    for idx, trophy in enumerate(trophies):
-        pairs = []
-        last_y = None
+        horizon = float(horizon)
+    except (TypeError, ValueError):
+        horizon = 0.0
+    target = parse_time(case.get("target"))
+    first_slot = None
+    for read in history:
+        if not isinstance(read, dict):
+            continue
+        slot = parse_time(read.get("slot")) or parse_time(read.get("at"))
+        if slot is not None:
+            first_slot = slot
+            break
+    per_trophy = []
+    raw_slopes = []
+    for index, trophy in enumerate(trophies):
+        points = []
+        last_logit = None
         for read in history:
-            rates = read.get("rates") or []
-            if idx >= len(rates):
+            if not isinstance(read, dict):
                 continue
-            rate = rates[idx]
+            rates = read.get("rates") or []
+            if index >= len(rates):
+                continue
+            rate = clamp_rate(rates[index])
             if rate is None:
                 continue
-            try:
-                rate_value = float(rate)
-            except (TypeError, ValueError):
+            moment = parse_time(read.get("slot")) or parse_time(read.get("at"))
+            if moment is None or first_slot is None:
                 continue
-            if not math.isfinite(rate_value):
+            hours = (moment - first_slot).total_seconds() / 3600.0
+            if hours < 0.0:
                 continue
-            try:
-                slot = parse_time(read.get("slot") or read.get("at"))
-            except (ValueError, TypeError):
-                continue
-            if first_slot is None:
-                continue
-            t_hours = (slot - first_slot).total_seconds() / 3600.0
-            if t_hours < 0.0:
-                continue
-            y = logit(rate_value)
-            pairs.append((t_hours, y))
-            last_y = y
-        median_logit, spread = forecast_trophy(pairs, last_y, target_hours, horizon_minutes)
-        rows.append({"id": trophy["id"], "q": quantiles(median_logit, spread)})
-    return rows
+            points.append((math.log1p(hours), logit_of(rate)))
+            last_logit = logit_of(rate)
+        per_trophy.append((points, last_logit))
+        if len(points) >= 3:
+            xs = [p[0] for p in points]
+            ys = [p[1] for p in points]
+            if len(set(xs)) >= 2 and max(ys) - min(ys) > 0.0:
+                fit = least_squares(xs, ys)
+                if fit is not None:
+                    raw_slopes.append((fit[0], len(points)))
+    if raw_slopes:
+        total_weight = sum(w for _, w in raw_slopes)
+        global_slope = sum(s * w for s, w in raw_slopes) / total_weight
+    else:
+        global_slope = 0.0
+    if target is not None and first_slot is not None:
+        target_hours = (target - first_slot).total_seconds() / 3600.0
+        target_x = math.log1p(max(0.0, target_hours))
+    else:
+        target_x = 0.0
+    rows = []
+    for index, trophy in enumerate(trophies):
+        points, last_logit = per_trophy[index]
+        median, spread = forecast_trophy(points, target_x, horizon,
+                                         last_logit, global_slope)
+        quantiles = []
+        previous = None
+        for z in Z_VALUES:
+            value = clamp_rate(inv_logit_pct(median + z * spread))
+            value = round4(value)
+            if previous is not None and value < previous:
+                value = previous
+            quantiles.append(value)
+            previous = value
+        rows.append({"id": trophy.get("id"), "q": quantiles})
+    return {"trophies": rows}
 
 
-def process_file(input_path, output_path):
-    """Read one case, write one forecast; never raise for a bad case."""
+def fallback_case(case):
+    """Persistence forecast used when the history is unusable."""
+    trophies = case.get("trophies") or []
+    history = case.get("history") or []
+    horizon = case.get("horizon_minutes") or 0
     try:
-        with open(input_path, "r", encoding="utf-8") as handle:
+        horizon = float(horizon)
+    except (TypeError, ValueError):
+        horizon = 0.0
+    walk = RW_COEF * math.sqrt(max(0.0, horizon) / 1440.0)
+    spread = min(SPREAD_CAP, math.sqrt(walk * walk + RESIDUAL_FLOOR ** 2
+                                       + REFRESH_FLOOR ** 2))
+    last_rates = {}
+    for read in history:
+        if not isinstance(read, dict):
+            continue
+        rates = read.get("rates") or []
+        for i, rate in enumerate(rates):
+            clamped = clamp_rate(rate)
+            if clamped is not None:
+                last_rates[i] = clamped
+    rows = []
+    for index, trophy in enumerate(trophies):
+        rate = last_rates.get(index, NO_HISTORY_RATE)
+        median = logit_of(rate)
+        quantiles = []
+        previous = None
+        for z in Z_VALUES:
+            value = round4(clamp_rate(inv_logit_pct(median + z * spread)))
+            if previous is not None and value < previous:
+                value = previous
+            quantiles.append(value)
+            previous = value
+        rows.append({"id": trophy.get("id"), "q": quantiles})
+    return {"trophies": rows}
+
+
+def process_file(in_path, out_path):
+    try:
+        with open(in_path, "r", encoding="utf-8") as handle:
             case = json.load(handle)
-        if not isinstance(case, dict):
-            raise ValueError("case is not an object")
-        trophies = case.get("trophies")
-        if not isinstance(trophies, list) or not trophies:
-            raise ValueError("case has no trophies")
-        for trophy in trophies:
-            if not isinstance(trophy, dict) or "id" not in trophy:
-                raise ValueError("trophy row lacks an id")
-        rows = forecast_case(case)
-    except Exception:
-        # Fall back to persistence on whatever we could salvage, so the
-        # case still yields a valid file instead of a crash.
+        if not isinstance(case, dict) or not case.get("trophies"):
+            return
         try:
-            with open(input_path, "r", encoding="utf-8") as handle:
-                case = json.load(handle)
-            trophies = case.get("trophies") if isinstance(case, dict) else None
-            history = case.get("history") if isinstance(case, dict) else None
-            horizon = case.get("horizon_minutes", 0) if isinstance(case, dict) else 0
-            if not isinstance(trophies, list) or not trophies:
-                return False
-            if not isinstance(history, list):
-                history = []
-            rows = persistence_rows(trophies, history, horizon)
+            result = forecast_case(case)
         except Exception:
-            return False
-    payload = {"trophies": rows}
-    text = json.dumps(payload, separators=(",", ":")) + "\n"
-    with open(output_path, "w", encoding="utf-8") as handle:
-        handle.write(text)
-    return True
+            result = fallback_case(case)
+    except Exception:
+        return
+    payload = json.dumps(result, separators=(",", ":"), sort_keys=False)
+    with open(out_path, "w", encoding="utf-8") as handle:
+        handle.write(payload)
 
 
 def main():
-    input_dir = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
-    output_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-    os.makedirs(output_dir, exist_ok=True)
-    try:
-        names = sorted(
-            name for name in os.listdir(input_dir) if name.endswith(".in")
-        )
-    except OSError:
-        return 0
+    in_dir = os.environ.get("MAKEFUN_INPUT_DIR") or "/input"
+    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
+    os.makedirs(out_dir, exist_ok=True)
+    names = sorted(name for name in os.listdir(in_dir)
+                   if name.endswith(".in"))
     for name in names:
         stem = name[:-3]
-        process_file(
-            os.path.join(input_dir, name),
-            os.path.join(output_dir, stem + ".out"),
-        )
-    return 0
+        process_file(os.path.join(in_dir, name),
+                     os.path.join(out_dir, stem + ".out"))
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
