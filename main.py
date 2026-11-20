@@ -151,8 +151,27 @@ def forecast_case(case):
     # Moving history: saturating log-time player growth.
     log_u = [math.log(1.0 + t) for t in u]
     log_p = [math.log(p) if p > 0 else 0.0 for p in players]
-    b_player, _ = ols_slope(log_u, log_p)
+    b_player, b_player_int = ols_slope(log_u, log_p)
     b_player = min(3.0, max(0.0, b_player))
+    # Shrink the player-growth slope toward the no-growth prior (0) in
+    # proportion to its estimation noise. The log-time fit's residual
+    # scatter gives the slope's standard error; when the slope is small
+    # relative to that error it is mostly noise, so pull it toward 0
+    # with the empirical-Bayes factor b^2 / (b^2 + se^2). A slope that
+    # is large relative to its error keeps nearly its full value, while
+    # a short or noisy history can no longer inflate m_player for every
+    # trophy at once. This mirrors the tier shrinkage already applied
+    # to the per-trophy earner slopes below.
+    if len(log_u) >= 3:
+        resid_p = [y - (b_player_int + b_player * x) for x, y in zip(log_u, log_p)]
+        mean_rp = sum(resid_p) / len(resid_p)
+        var_p = sum((r - mean_rp) ** 2 for r in resid_p) / (len(resid_p) - 1)
+        mean_log_u = sum(log_u) / len(log_u)
+        sxx_p = sum((x - mean_log_u) ** 2 for x in log_u)
+        if sxx_p > 0.0 and var_p > 0.0 and b_player > 0.0:
+            se_p = math.sqrt(var_p / sxx_p)
+            shrink_p = (b_player ** 2) / (b_player ** 2 + se_p ** 2)
+            b_player = b_player * shrink_p
     ratio = (1.0 + u_target) / (1.0 + u_last)
     m_player = ratio ** b_player
     m_player = max(1.0, min(500.0, m_player))
